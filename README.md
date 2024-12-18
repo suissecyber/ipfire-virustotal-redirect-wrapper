@@ -1,0 +1,1 @@
+# ipfire-virustotal-redirect-wrapper
