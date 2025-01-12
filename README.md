@@ -30,13 +30,15 @@ Installation
 1.  **Download and Prepare the Files**: Clone this repository or download the script directly.
     
     ```bash
-    git clone github.com/suissecyber/ipfire-virustotal-redirect-wrapper.git
+    pakfire install -y git
+    git clone https://github.com/suissecyber/ipfire-virustotal-redirect-wrapper.git
     cd ipfire-virustotal-redirect-wrapper
     ``` 
     
 2.  **Run the Installer**: Execute the installation script to copy necessary files, create backups, and apply changes.
     
     ```bash
+    chmod +x install.sh
     sudo ./install.sh
     ``` 
     
