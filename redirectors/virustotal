@@ -1,0 +1,351 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use IO::Handle;
+use HTTP::Tiny;
+use POSIX qw(strftime);
+
+# Enable immediate flushing
+$| = 1;
+
+# Include file from IPFire
+require '/var/ipfire/general-functions.pl';
+
+# Load values from the configuration file
+my %proxysettings = ();
+&General::readhash("${General::swroot}/proxy/settings", \%proxysettings);
+&General::readhash("${General::swroot}/proxy/advanced/settings", \%proxysettings);
+
+my $logfile = '/var/log/virustotal/squid_redirector.log';
+my $server = "http://localhost";
+my %url_cache; 
+
+# Retrieve the API_KEY
+my $API_KEY = $proxysettings{'VIRUSTOTAL_API_KEY'};
+
+# Populate the @extensions array with data from VIRUSTOTAL_EXTENSIONS
+my @extensions = split(' ', $proxysettings{'VIRUSTOTAL_EXTENSIONS'});
+
+# Populate the @mime_types array with data from VIRUSTOTAL_MIME_TYPES
+my @mime_types = split(' ', $proxysettings{'VIRUSTOTAL_MIME_TYPES'});
+
+# ADD $proxysettings{'VIRUSTOTAL_SAFE_SEARCH_ENGINES'}
+my @safe_search_engines = (
+    qr{^(?:https?:\/\/)?(?:www\.)?google\.[a-z]{2,}\/},
+    qr{^(?:https?:\/\/)?(?:[a-z0-9-]+\.)?bing\.[a-z]{2,}\/},
+    qr{^(?:https?:\/\/)?(?:www\.)?yahoo\.[a-z]{2,}\/},
+    qr{^(?:https?:\/\/)?(?:www\.)?duckduckgo\.[a-z]{2,}\/},
+    qr{^(?:https?:\/\/)?(?:www\.)?search\.com\/},
+    qr{^(?:https?:\/\/)?(?:www\.)?search\.yahoo\.[a-z]{2,}\/},
+    qr{^(?:https?:\/\/)?(?:www\.)?gstatic\.com\/}, 
+    qr{^(?:https?:\/\/)?(?:www\.)?youtube\.com\/}, 
+    qr{^(?:https?:\/\/)?(?:www\.)?ytimg\.com\/},  
+    qr{^(?:https?:\/\/)?(?:www\.)?googleusercontent\.com\/}, 
+    qr{^(?:https?:\/\/)?(?:[a-z0-9-]+\.)?gstatic\.[a-z]{2,}\/},
+    qr{^(?:https?:\/\/)?(?:[a-z0-9-]+\.)?apis\.google\.[a-z]{2,}\/} 
+);
+
+open(my $logfh, '>>', $logfile) or die "Unable to open the log file: $!";
+$logfh->autoflush(1);
+
+sub format_timestamp {
+	
+    my ($epoch_time) = @_;
+    my ($seconds, $milliseconds) = split(/\./, $epoch_time);
+    my $formatted_time = strftime("%Y-%m-%d %H:%M:%S", localtime($seconds));
+
+    if (defined $milliseconds) {
+        $formatted_time .= ".$milliseconds";
+    }
+
+    return $formatted_time;
+}
+
+sub is_safe_search_engine {
+    my $request_url = shift;
+
+    foreach my $pattern (@safe_search_engines) {
+        if ($request_url =~ $pattern) {
+            # URL comes from a secure search engine
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+# Function to check whether the URL has an extension or MIME type to be parsed
+sub is_file_or_mime_type_to_analyze {
+    # my ($url) = @_;
+
+    my ($url, $proxysettings_ref) = @_;
+    my %proxysettings = %{$proxysettings_ref};
+
+    # Ignore safe search engines (request that seems redundant, do not remove)
+   if (is_safe_search_engine($url)) {
+        #print $logfh "[".format_timestamp(time())."] URL FROM SEARCH ENGINE BYPASSED: $url\n";
+        return 0;
+   }
+
+
+    # Check if the URL ends with one of the extensions
+    foreach my $ext (@extensions) {
+        if ($url =~ /\Q$ext\E/i) {
+            #$is_filtered = 1;
+            #last;
+            return 1;
+        }
+    }
+
+    # Check if it is an extension file and is not among the extensions to be scanned
+
+                #if($url =~ s/\?.*$// && $url =~ /\.[a-zA-Z0-9]{2,4}$/i) {
+                if ($url =~ /\.[a-zA-Z0-9]{2,4}(?=\?|$)/) {
+                print $logfh "[".format_timestamp(time())."] EXTENSION NOT TO BE SCANNED: $url\n";
+                return 0;
+                }
+
+
+if ($proxysettings{'VIRUSTOTAL_ENABLE_MIME_FILTER'} ne 'on') {
+print $logfh "[".format_timestamp(time())."] MIME TYPE FILTERING DISABLED: $url\n";
+return 0;
+}
+
+    # IF NO EXTENSION MATCHES, CHECK THE MIME TYPE
+#    if (!$is_filtered) {
+        # Extract the MIME type with curl
+        my $agent = "-A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:110.0) Gecko/20100101 Firefox/110.0'";
+        my $curl_command = "curl -s -I -L $agent '$url'";  # -I to get only the headers
+        my $headers = `$curl_command`;
+        my $mime_type = '';
+
+        if ($headers =~ /Content-Type:\s*([\w\/\-]+)/i) {
+            $mime_type = $1;
+        }
+
+        print $logfh "[".format_timestamp(time())."] MIME TYPE IDENTIFICATION: [$mime_type] $url\n";
+
+        # Condition to make a complete request if the MIME type is text/html
+        if ($mime_type =~ m{^(text/html)}) {
+            #print $logfh "[".format_timestamp(time())."] FILE $mime_type FULL REQUEST.\n";
+
+            # Make a full request to determine the true MIME type
+            my $curl_full_command = "curl -s -L -o /dev/null -w '%{content_type}' $agent '$url'";
+            my $true_mime_type = `$curl_full_command`;
+            chomp($true_mime_type);
+
+            # Update the MIME type
+            $mime_type = $true_mime_type;
+
+            print $logfh "[".format_timestamp(time())."] VALIDATION MIME TYPE: [$mime_type] $url\n";
+        }
+
+        # Check if the MIME type is among those to be monitored
+        foreach my $type (@mime_types) {
+            #if ($mime_type eq $type) {
+                ### FIX MIME TYPE: [application/pdf;charset=UTF-8]
+                if (index($mime_type, $type) == 0) {
+                #$is_filtered = 1;
+                return 1;
+            }
+        }
+ #   }
+
+    return 0;
+}
+
+sub url_encode {
+    my ($url) = @_;
+	# Encode special characters
+    $url =~ s/([^A-Za-z0-9_.~])/sprintf("%%%02X", ord($1))/ge;  
+    return $url;
+}
+
+sub check_url {
+    my ($url) = @_;
+    my $encoded_url = url_encode($url);
+    my $curl_command = "curl -s -X POST 'https://www.virustotal.com/api/v3/urls' " .
+                       "--header 'x-apikey: $API_KEY' " .
+                       "--header 'content-type: application/x-www-form-urlencoded' " .
+                       "--data 'url=$encoded_url'";
+
+    my $response = `$curl_command`;
+    if ($? != 0) {
+        print $logfh "[".format_timestamp(time())."] ERROR WHEN EXECUTING CURL: $!\n";
+        return undef;  # Returns undef in case of error
+    }
+
+    if ($response =~ /"id":"([^"]+)"/) {
+        return $1;  # Returns the ID
+    }
+
+    if ($response =~ /"data":\s*{[^}]*?"id":\s*"([^"]+)"/) {
+        return $1;  # Returns the ID
+    }
+
+    print $logfh "[".format_timestamp(time())."] ERROR: ANALYSIS ID NOT FOUND IN RESPONSE.$response\n";
+    return undef;  # Returns undef if not found
+}
+
+sub get_analysis_report {
+    my ($analysis_id) = @_;
+    my $report_command = "curl -s --request GET " .
+                         "--url 'https://www.virustotal.com/api/v3/analyses/$analysis_id' " .
+                         "--header 'x-apikey: $API_KEY'";
+
+    my $report_response = `$report_command`;
+    if ($? != 0) {
+        print $logfh "[".format_timestamp(time())."] ERROR WHILE RUNNING CURL FOR REPORT: $!\n";
+        return undef;  # Returns undef in case of error
+    }
+
+    # Debug: Log of response received
+    #print $logfh “[”.format_timestamp(time()).“] Response report from VirusTotal: $report_response\n”; # Added for debugging
+
+    # Check if the response contains the “status” field
+    if ($report_response =~ /"status"\s*:\s*"([^"]+)"/) {
+        my $status = $1;
+        print $logfh "[".format_timestamp(time())."] ANALYSIS STATUS: $status\n";
+        return $report_response;  # Returns the complete answer if the state is found
+    } else {
+        print $logfh "[".format_timestamp(time())."] ERROR: ANALYSIS STATUS NOT FOUND IN RESPONSE: $report_response\n";
+        return undef;  # Returns undef if state is not found
+    }
+}
+
+sub wait_for_analysis {
+    my ($analysis_id) = @_;
+    my $start_time = time();
+
+	# Timeout in seconds
+    my $timeout = 30;  
+	# Delay between controls
+    my $delay = 3;     
+    my $current_time = time();
+    my $elapsed_time = $current_time - $start_time;
+
+   # Check if the timeout has expired
+    if ($elapsed_time > $timeout) {
+        print $logfh "[".format_timestamp(time())."] TIMEOUT REACHED DURING ID PARSING: $analysis_id\n";
+        return undef;  # Timeout reached, exits the function
+    }
+
+    my $report_response = get_analysis_report($analysis_id);
+    if (!defined $report_response) {
+        print $logfh "[".format_timestamp(time())."] ERROR WHEN RETRIEVING REPORT FOR ID: $analysis_id\n";
+        return undef;  # Exit if there is an error in the report
+    }
+
+    if ($report_response =~ /"status"\s*:\s*"([^"]+)"/) {
+        my $status = $1;
+        if ($status eq 'completed') {
+            print $logfh "[".format_timestamp(time())."] ANALYSIS COMPLETED FOR ID: $analysis_id\n";
+            return $report_response;  # Exits the function if the analysis is completed
+        } elsif ($status eq 'queued') {
+            print $logfh "[".format_timestamp(time())."] QUEUE ANALYSIS... RECURRENCE CALL AFTER $delay SECONDS. (ID: $analysis_id)\n";
+
+            sleep($delay);  # Waits before the next call
+            return wait_for_analysis($analysis_id); 
+        } else {
+            print $logfh "[".format_timestamp(time())."] ERROR IN VIRUSTOTAL REPORT ANALYSIS FOR ID: $analysis_id. Stato: $status\n";
+            return undef;  # Exit in case of error status
+        }
+    } else {
+        print $logfh "[".format_timestamp(time())."] ERROR IN REPORT RESPONSE, STATUS NOT FOUND.\n";
+        return undef;  # Exit if the “status” field is not found in the report.
+    }
+}
+
+sub process_request {
+    my ($request, $url, $method) = @_;
+
+# Ignore safe search engines
+#    if (is_safe_search_engine($url)) {
+#        print "$request\n";
+#        #print $logfh "[".format_timestamp(time())."] #URL FROM SECURE SEARCH ENGINE BYPASSED: $url\n";
+#        return;
+#    }
+
+     # Check if the URL is already cached and if so, block it
+    if (exists $url_cache{$url}) {
+         my $state = $url_cache{$url};
+        if ($state == 3) {
+            print $logfh "[".format_timestamp(time())."] URL BEING ANALYZED, TEMPORARILY BLOCKED: $url\n";
+            #print "OK status=303 url=\"$server?error_code=error_temporarily_blocked&url=\"".$url."\n";
+            return;
+        } elsif ($state == 1) {
+            print $logfh "[".format_timestamp(time())."] [CACHED URL, CLEAN]: $url\n";
+            print "ERR\n";
+            return;
+        } elsif ($state == 2) {
+            print $logfh "[".format_timestamp(time())."] [CACHED URL, INFECTED]: $url\n";
+            print "OK status=303 url=\"$server?error_code=cached_url_file_infected&url=\"".$url."\n";
+            return;
+        }
+        else {
+             print $logfh "[".format_timestamp(time())."] -------------- LOOP MANAGEMENT TO CONTROL: $url\n";
+            return;
+        }
+    }
+
+    # Check if the URL is to be parsed
+     if (is_file_or_mime_type_to_analyze($url, \%proxysettings)) {
+        print $logfh "[".format_timestamp(time())."] FOUND FILE TO ANALYZE: $url\n";
+
+        $url_cache{$url} = 3;
+
+       # Starts URL analysis
+        my $analysis_id = check_url($url);
+        if (!defined $analysis_id) {
+            print $logfh "[".format_timestamp(time())."] ERROR IN URL PARSING: $url\n";
+            print "OK status=303 url=\"$server?error_code=error_url_parsing&url=\"".$url."\n";
+            return;
+        }
+
+        # Wait for analysis to complete
+        my $report_response = wait_for_analysis($analysis_id);
+        if (!defined $report_response) {
+            print $logfh "[".format_timestamp(time())."] TIMEOUT OR ERROR IN THE REPORT FOR THE URL: $url\n";
+            print "OK status=303 url=\"$server?error_code=timeout_or_report_error&url=\"".$url."\n";
+            return;
+        }
+
+
+        my $malicious = ($report_response =~ /"malicious":\s*([0-9]+)/) ? $1 : 0;
+        if ($malicious > 0) {
+            # Update cached url status as infected
+            $url_cache{$url} = 2;
+            print $logfh "[".format_timestamp(time())."] [URL BLOCKED AS INFECTED]: $url\n";
+             print "OK status=303 url=\"$server?error_code=file_infected&url=\"".$url."\n";
+             return;
+        } else {
+            # Update the state of the cached URL as clean
+            $url_cache{$url} = 1;
+            print $logfh "[".format_timestamp(time())."] [SAFE URL]: $url\n";
+            print "ERR\n";  # Send back the original URL
+            return;
+        }
+    } else {
+        print "ERR\n";  # Let other unfiltered URLs through.
+        #print $logfh "[".format_timestamp(time())."] URL NOT PARSED: $url\n";
+    }
+}
+
+
+while (<>) {
+
+    my $request = $_;
+
+      if ($request =~ m{^(https?://[^\s]+)\s+([\d\.]+/\d+\.\d+\.\d+\.\d+)\s+-\s+(GET)\s+myip=([\d\.]+)\s+myport=(\d+)$}) {
+        my $url = $1;
+        my $method = $3;
+
+        process_request($request, $url, $method);
+    } else {
+        #print $logfh "[".format_timestamp(time())."] REQUEST: $request\n";
+        print "ERR\n";  # We send the original URL back as a response
+    }
+}
+
+close($logfh);
