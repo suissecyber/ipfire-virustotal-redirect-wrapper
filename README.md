@@ -1,4 +1,4 @@
-IPFire 2.29 VirusTotal Integration
+VirusTotal Integration for IPFire 2.29
 =============================
 
 This project integrates VirusTotal scanning functionality into the [IPFire 2.29](https://www.ipfire.org/) firewall system. By adding a redirector and modifying the existing proxy configuration, it enables advanced scanning of traffic and file extensions using VirusTotal's API.
